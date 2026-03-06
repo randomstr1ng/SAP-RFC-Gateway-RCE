@@ -888,8 +888,14 @@ def _build_p3_args(conv_id, program, args, pte, sid='A4H', appserver='vhcala4hci
             pkt[off] = (pkt[off] + cmd_delta) & 0xFF
 
     if args_delta != 0:
-        # Args running counter byte (tracks args_delta * 16)
-        pkt[1493] = (pkt[1493] + args_delta * 16) & 0xFF
+        # Bytes [1492:1494) form a 2-byte BE size field.  The args_delta*16
+        # adjustment can overflow a single byte when args grow by 2+ bytes
+        # (base 0xe7=231, only 1 unit headroom in the low byte).
+        # Propagate carry to the high byte at 1492.
+        old_val = (pkt[1492] << 8) | pkt[1493]
+        new_val = old_val + args_delta * 16
+        pkt[1492] = (new_val >> 8) & 0xFF
+        pkt[1493] = new_val & 0xFF
 
         # Post-args byte counters tracking args_delta
         for off in [1515, 1541]:
